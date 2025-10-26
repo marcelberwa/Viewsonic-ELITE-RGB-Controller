@@ -1,6 +1,8 @@
 import hid
 import time
 import sys
+import struct
+import threading
 
 # ViewSonic Elite XG270QC HID identifiers
 VID = 0x0543
@@ -135,6 +137,132 @@ def set_mode(mode_name, color_base=None, color_rear=None):
         return False
 
 
+# Global flag for music mode streaming
+_music_streaming = False
+
+
+def set_music_mode(variant="music", duration=None):
+    """
+    Activate music mode with real-time audio visualization.
+    
+    This activates the music or music-pulse mode and starts a daemon thread
+    that streams simulated audio data to the device. The thread will continue
+    running until stop_music_mode() is called or the program exits.
+    
+    Args:
+        variant (str): "music" or "music-pulse" (default: "music")
+        duration (int): Optional duration in seconds. If None, runs until stopped.
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    global _music_streaming
+    
+    if variant.lower() not in ["music", "music-pulse"]:
+        print(f"Error: Music variant must be 'music' or 'music-pulse'")
+        return False
+    
+    # First, set the mode via feature report
+    if not set_mode(variant):
+        return False
+    
+    # Start audio streaming thread
+    _music_streaming = True
+    stream_thread = threading.Thread(
+        target=_music_stream_worker,
+        args=(variant.lower(), duration),
+        daemon=True
+    )
+    stream_thread.start()
+    
+    print(f"Music mode '{variant}' activated. Streaming audio data...")
+    if duration:
+        print(f"Will run for {duration} seconds.")
+    else:
+        print("Running until stopped. Call stop_music_mode() to stop.")
+    
+    return True
+
+
+def stop_music_mode():
+    """Stop music mode streaming."""
+    global _music_streaming
+    _music_streaming = False
+    print("Stopping music mode streaming...")
+
+
+def _music_stream_worker(variant, duration):
+    """
+    Worker thread that streams audio visualization data to the device.
+    
+    Sends 64-byte interrupt packets with simulated audio data at ~100Hz.
+    Packet format:
+        Byte 0: 0x01 (Report ID)
+        Byte 1: 0xC0 (fixed)
+        Byte 2: 0x00 (fixed)
+        Byte 3: Bass level / Energy meter (0x00-0xFF)
+        Byte 4: Left channel / Frequency bin (0x00-0xFF)
+        Byte 5: Right channel / Frequency bin (0x00-0xFF)
+        Bytes 6-63: Padding (0x00)
+    """
+    global _music_streaming
+    
+    try:
+        dev = hid.device()
+        dev.open(VID, PID)
+        
+        start_time = time.time()
+        packet_count = 0
+        
+        while _music_streaming:
+            # Check if duration has elapsed
+            if duration and (time.time() - start_time) >= duration:
+                break
+            
+            # Simulate audio data with some variation
+            # In a real implementation, you would capture audio from the system
+            elapsed = time.time() - start_time
+            
+            # Create pulsing bass and frequency data
+            bass = int(128 + 100 * abs(__import__('math').sin(elapsed * 2)))  # Pulsing at 2Hz
+            freq_l = int(128 + 80 * __import__('math').sin(elapsed * 3 + 0))  # 3Hz
+            freq_r = int(128 + 80 * __import__('math').sin(elapsed * 3 + 1))  # 3Hz offset
+            
+            # Clamp values to 0-255
+            bass = max(0, min(255, bass))
+            freq_l = max(0, min(255, freq_l))
+            freq_r = max(0, min(255, freq_r))
+            
+            # Build 64-byte interrupt packet
+            packet = bytearray(64)
+            packet[0] = 0x01  # Report ID
+            packet[1] = 0xC0  # Fixed
+            packet[2] = 0x00  # Fixed
+            packet[3] = bass  # Bass/Energy
+            packet[4] = freq_l  # Left channel
+            packet[5] = freq_r  # Right channel
+            # Rest is zeros (padding)
+            
+            # Send interrupt report to endpoint 0x02
+            try:
+                dev.write(bytes(packet))
+                packet_count += 1
+            except Exception as e:
+                print(f"Warning: Failed to send packet: {e}")
+            
+            # Target ~100Hz (10ms between packets)
+            time.sleep(0.01)
+        
+        dev.close()
+        print(f"Music mode stopped. Sent {packet_count} packets.")
+    
+    except Exception as e:
+        print(f"Error in music streaming: {e}")
+    
+    finally:
+        _music_streaming = False
+
+
 def list_modes():
     """List all available modes."""
     print("Available modes:")
@@ -157,16 +285,51 @@ def main():
     With arguments: Set specific mode and optional colors for base and rear zones.
     
     Usage:
-        python set_mode.py                                    # Cycle all modes
-        python set_mode.py <mode>                             # Set mode with default colors
-        python set_mode.py <mode> <color>                     # Set mode with same color on both zones
-        python set_mode.py <mode> <color_base> <color_rear>   # Set mode with different colors per zone
-        python set_mode.py <mode> <R> <G> <B>                 # Set mode with custom RGB (both zones)
-        python set_mode.py <mode> <R1> <G1> <B1> <R2> <G2> <B2>  # Set mode with different RGB per zone
+        python set_mode.py                                              # Cycle all modes
+        python set_mode.py <mode>                                       # Set mode with default colors
+        python set_mode.py <mode> <color>                               # Set mode with same color on both zones
+        python set_mode.py <mode> <color_base> <color_rear>             # Set mode with different colors per zone
+        python set_mode.py <mode> <R> <G> <B>                           # Set mode with custom RGB (both zones)
+        python set_mode.py <mode> <R1> <G1> <B1> <R2> <G2> <B2>        # Set mode with different RGB per zone
+        python set_mode.py music [duration]                             # Start music mode (optional duration in seconds)
+        python set_mode.py music-pulse [duration]                       # Start music-pulse mode (optional duration in seconds)
     """
     if len(sys.argv) >= 2:
         # User provided mode argument
-        mode = sys.argv[1]
+        mode = sys.argv[1].lower()
+        
+        # Handle music modes separately
+        if mode in ["music", "music-pulse"]:
+            duration = None
+            if len(sys.argv) >= 3:
+                try:
+                    duration = int(sys.argv[2])
+                except ValueError:
+                    print("Error: Duration must be an integer (seconds)")
+                    return
+            
+            try:
+                set_music_mode(mode, duration)
+                
+                # If duration specified, wait for it
+                if duration:
+                    time.sleep(duration + 1)  # +1 second for safety
+                    stop_music_mode()
+                else:
+                    # Keep the program running
+                    try:
+                        while _music_streaming:
+                            time.sleep(0.1)
+                    except KeyboardInterrupt:
+                        print("\n")
+                        stop_music_mode()
+            
+            except KeyboardInterrupt:
+                print("\n")
+                stop_music_mode()
+            return
+        
+        # Handle regular modes
         color_base = None
         color_rear = None
         
@@ -214,9 +377,11 @@ def main():
             # Cycle through modes
             print("=== MODES ===")
             for mode_name in MODES.keys():
-                print(f"Setting mode: {mode_name}")
-                set_mode(mode_name)
-                time.sleep(5)
+                # Skip music modes in default cycle
+                if mode_name not in ["music", "music-pulse"]:
+                    print(f"Setting mode: {mode_name}")
+                    set_mode(mode_name)
+                    time.sleep(5)
             
             # Cycle through colors in static mode
             print("\n=== COLORS (Static Mode) ===")
@@ -224,7 +389,12 @@ def main():
                 print(f"Setting color: {color_name} RGB({r}, {g}, {b})")
                 set_mode("static", color_name)
                 time.sleep(3)
-            
+
+            # print("\n=== MUSIC MODE ===")
+            # set_music_mode("music")
+            # time.sleep(20)
+            # stop_music_mode()
+
             print("\nCycle complete!")
         
         except KeyboardInterrupt:
