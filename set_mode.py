@@ -1,11 +1,24 @@
-import hid
+"""
+ViewSonic RGB Controller - Razer Chroma SDK Support
+Uses pywinusb for HID communication
+"""
+
 import time
 import sys
-import struct
 import threading
 
-# ViewSonic Elite XG270QC HID identifiers
-VID = 0x0543
+try:
+    import pywinusb.hid as hid
+except ImportError:
+    print("ERROR: pywinusb not installed!")
+    print("Run: pip install pywinusb")
+    sys.exit(1)
+
+# ViewSonic Vendor ID and supported PIDs
+VIEWSONIC_VID = 0x0543
+SUPPORTED_PIDS = [0xA002]  # ViewSonic Elite XG270QC
+
+VID = VIEWSONIC_VID
 PID = 0xA002
 
 # Mode payloads (167 bytes each)
@@ -53,353 +66,289 @@ COLORS = {
     "teal": (0x00, 0x80, 0x80),
 }
 
+# Music mode flag
+_music_stop_flag = False
 
-def set_mode(mode_name, color_base=None, color_rear=None):
-    """
-    Set the display mode.
-    
-    Args:
-        mode_name (str): Mode to set. Available modes: static, rainbow, breathing, stack, warp-speed, music, music-pulse
-        color_base (tuple or str): Optional color for base zone (R, G, B) or color name.
-        color_rear (tuple or str): Optional color for rear zone (R, G, B) or color name. If not provided, uses color_base.
-    
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    if mode_name.lower() not in MODES:
-        print(f"Error: Mode '{mode_name}' not found. Available modes: {', '.join(MODES.keys())}")
-        return False
-    
-    payload = MODES[mode_name.lower()].copy()
-    
-    # If only one color is provided, use it for both zones
-    if color_rear is None:
-        color_rear = color_base
-    
-    # Handle color_base parameter
-    if color_base is not None:
-        if isinstance(color_base, str):
-            if color_base.lower() not in COLORS:
-                print(f"Error: Color '{color_base}' not found. Available colors: {', '.join(COLORS.keys())}")
-                return False
-            r_base, g_base, b_base = COLORS[color_base.lower()]
-        else:
-            try:
-                r_base, g_base, b_base = color_base
-            except (TypeError, ValueError):
-                print("Error: Color must be a tuple (R, G, B) or a color name string")
-                return False
-        
-        # Set base zone color (bytes 2-4)
-        payload[2] = r_base
-        payload[3] = g_base
-        payload[4] = b_base
-    
-    # Handle color_rear parameter
-    if color_rear is not None:
-        if isinstance(color_rear, str):
-            if color_rear.lower() not in COLORS:
-                print(f"Error: Color '{color_rear}' not found. Available colors: {', '.join(COLORS.keys())}")
-                return False
-            r_rear, g_rear, b_rear = COLORS[color_rear.lower()]
-        else:
-            try:
-                r_rear, g_rear, b_rear = color_rear
-            except (TypeError, ValueError):
-                print("Error: Color must be a tuple (R, G, B) or a color name string")
-                return False
-        
-        # Set rear zone color (bytes 9-11)
-        payload[9] = r_rear
-        payload[10] = g_rear
-        payload[11] = b_rear
+
+def find_viewsonic_devices():
+    """Find all connected ViewSonic devices"""
+    devices = []
     
     try:
-        dev = hid.device()
-        dev.open(VID, PID)
-        dev.send_feature_report(payload)
-        dev.close()
+        all_devices = hid.find_all_hid_devices()
         
-        if color_base is not None:
-            base_str = color_base if isinstance(color_base, str) else f"RGB({color_base[0]}, {color_base[1]}, {color_base[2]})"
-            
-            if color_rear is not None and color_rear != color_base:
-                rear_str = color_rear if isinstance(color_rear, str) else f"RGB({color_rear[0]}, {color_rear[1]}, {color_rear[2]})"
-                print(f"Set mode to '{mode_name}' with base zone: {base_str}, rear zone: {rear_str}")
-            else:
-                print(f"Set mode to '{mode_name}' with color {base_str} (both zones)")
-        else:
-            print(f"Set mode to '{mode_name}'")
-        return True
-    
+        for i, device in enumerate(all_devices):
+            if device.vendor_id == VIEWSONIC_VID and device.product_id in SUPPORTED_PIDS:
+                devices.append({
+                    'index': len(devices),
+                    'device': device,
+                    'vendor_id': device.vendor_id,
+                    'product_id': device.product_id,
+                    'product': device.product_name or 'ViewSonic Monitor',
+                    'serial': device.serial_number or 'Unknown',
+                    'manufacturer': 'ViewSonic',
+                    'path': str(device)  # Use string representation for path
+                })
     except Exception as e:
-        print(f"Error communicating with device: {e}")
-        return False
-
-
-# Global flag for music mode streaming
-_music_streaming = False
-
-
-def set_music_mode(variant="music", duration=None):
-    """
-    Activate music mode with real-time audio visualization.
+        print(f"Error finding devices: {e}", file=sys.stderr)
     
-    This activates the music or music-pulse mode and starts a daemon thread
-    that streams simulated audio data to the device. The thread will continue
-    running until stop_music_mode() is called or the program exits.
+    return devices
+
+
+def list_viewsonic_devices():
+    """Print all connected ViewSonic devices"""
+    devices = find_viewsonic_devices()
+    
+    if not devices:
+        print("\nNo ViewSonic devices found!")
+        return
+    
+    print(f"\nFound {len(devices)} ViewSonic device(s):\n")
+    print(f"{'Index':<8} {'Device':<30} {'Serial':<20} {'Manufacturer':<15}")
+    print("-" * 73)
+    
+    for device in devices:
+        print(
+            f"{device['index']:<8} "
+            f"{device['product']:<30} "
+            f"{device['serial']:<20} "
+            f"{device['manufacturer']:<15}"
+        )
+
+
+def get_device_by_index(index):
+    """Get device info by index"""
+    devices = find_viewsonic_devices()
+    if 0 <= index < len(devices):
+        return devices[index]
+    return None
+
+
+def set_mode(mode_name, color_base=None, color_rear=None, device_index=None):
+    """
+    Set RGB mode on device
     
     Args:
-        variant (str): "music" or "music-pulse" (default: "music")
-        duration (int): Optional duration in seconds. If None, runs until stopped.
-    
-    Returns:
-        bool: True if successful, False otherwise
+        mode_name: static, rainbow, breathing, stack, warp-speed, music, music-pulse
+        color_base: (R, G, B) tuple for base zone (or color name string)
+        color_rear: (R, G, B) tuple for rear zone (or color name string)
+        device_index: Which device to control (None = all devices)
     """
-    global _music_streaming
     
-    if variant.lower() not in ["music", "music-pulse"]:
-        print(f"Error: Music variant must be 'music' or 'music-pulse'")
+    if mode_name not in MODES:
+        print(f"ERROR: Unknown mode '{mode_name}'")
+        print(f"Available modes: {', '.join(MODES.keys())}")
         return False
     
-    # First, set the mode via feature report
-    if not set_mode(variant):
+    # Convert color names to RGB tuples
+    if isinstance(color_base, str):
+        color_base = COLORS.get(color_base.lower())
+    if isinstance(color_rear, str):
+        color_rear = COLORS.get(color_rear.lower())
+    
+    # Get list of devices to control
+    if device_index is None:
+        devices = find_viewsonic_devices()
+        device_indices = [d['index'] for d in devices]
+    else:
+        device_indices = [device_index]
+    
+    if not device_indices:
+        print("ERROR: No ViewSonic devices found!")
         return False
     
-    # Start audio streaming thread
-    _music_streaming = True
-    stream_thread = threading.Thread(
+    success = True
+    
+    for idx in device_indices:
+        try:
+            device_info = get_device_by_index(idx)
+            if not device_info:
+                print(f"ERROR: Device #{idx} not found")
+                success = False
+                continue
+            
+            payload = MODES[mode_name].copy()
+            
+            # Set colors if applicable
+            if mode_name in ["static", "breathing", "stack"]:
+                if color_base:
+                    payload[2] = color_base[0]
+                    payload[3] = color_base[1]
+                    payload[4] = color_base[2]
+                
+                if color_rear:
+                    payload[9] = color_rear[0]
+                    payload[10] = color_rear[1]
+                    payload[11] = color_rear[2]
+            
+            # Send feature report
+            device = device_info['device']
+            device.open()
+            device.send_feature_report(payload)
+            device.close()
+            
+            # Print confirmation
+            if color_base and color_rear:
+                print(f"Set {device_info['product']} (#{idx}) to {mode_name} "
+                      f"(base: RGB{color_base}, rear: RGB{color_rear})")
+            elif color_base:
+                print(f"Set {device_info['product']} (#{idx}) to {mode_name} "
+                      f"(RGB{color_base})")
+            else:
+                print(f"Set {device_info['product']} (#{idx}) to {mode_name}")
+                
+        except Exception as e:
+            print(f"ERROR setting mode on device #{idx}: {e}", file=sys.stderr)
+            success = False
+    
+    return success
+
+
+def set_music_mode(variant, duration=None, device_index=None):
+    """Start music visualization mode"""
+    global _music_stop_flag
+    
+    if variant not in ["music", "music-pulse"]:
+        print(f"ERROR: Invalid music variant '{variant}'")
+        return False
+    
+    # First set the mode
+    set_mode(variant, device_index=device_index)
+    
+    # Start music streaming
+    _music_stop_flag = False
+    thread = threading.Thread(
         target=_music_stream_worker,
-        args=(variant.lower(), duration),
+        args=(variant, duration, device_index),
         daemon=True
     )
-    stream_thread.start()
+    thread.start()
     
-    print(f"Music mode '{variant}' activated. Streaming audio data...")
     if duration:
-        print(f"Will run for {duration} seconds.")
-    else:
-        print("Running until stopped. Call stop_music_mode() to stop.")
+        thread.join(timeout=duration)
+        stop_music_mode()
     
     return True
 
 
 def stop_music_mode():
-    """Stop music mode streaming."""
-    global _music_streaming
-    _music_streaming = False
-    print("Stopping music mode streaming...")
+    """Stop music mode streaming"""
+    global _music_stop_flag
+    _music_stop_flag = True
 
 
-def _music_stream_worker(variant, duration):
-    """
-    Worker thread that streams audio visualization data to the device.
+def _music_stream_worker(variant, duration, device_index):
+    """Background worker for music mode streaming"""
+    global _music_stop_flag
+    import math
     
-    Sends 64-byte interrupt packets with simulated audio data at ~100Hz.
-    Packet format:
-        Byte 0: 0x01 (Report ID)
-        Byte 1: 0xC0 (fixed)
-        Byte 2: 0x00 (fixed)
-        Byte 3: Bass level / Energy meter (0x00-0xFF)
-        Byte 4: Left channel / Frequency bin (0x00-0xFF)
-        Byte 5: Right channel / Frequency bin (0x00-0xFF)
-        Bytes 6-63: Padding (0x00)
-    """
-    global _music_streaming
+    devices = find_viewsonic_devices()
+    if device_index is not None:
+        devices = [d for d in devices if d['index'] == device_index]
+    
+    if not devices:
+        print("ERROR: No devices for music streaming")
+        return
+    
+    start_time = time.time()
+    tick = 0
     
     try:
-        dev = hid.device()
-        dev.open(VID, PID)
-        
-        start_time = time.time()
-        packet_count = 0
-        
-        while _music_streaming:
-            # Check if duration has elapsed
-            if duration and (time.time() - start_time) >= duration:
+        while not _music_stop_flag:
+            if duration and (time.time() - start_time) > duration:
                 break
             
-            # Simulate audio data with some variation
-            # In a real implementation, you would capture audio from the system
-            elapsed = time.time() - start_time
+            # Generate audio-like data
+            bass = int(128 + 127 * math.sin(tick * 0.02))
+            freq_l = int(128 + 100 * math.sin(tick * 0.03))
+            freq_r = int(128 + 100 * math.cos(tick * 0.03))
             
-            # Create pulsing bass and frequency data
-            bass = int(128 + 100 * abs(__import__('math').sin(elapsed * 2)))  # Pulsing at 2Hz
-            freq_l = int(128 + 80 * __import__('math').sin(elapsed * 3 + 0))  # 3Hz
-            freq_r = int(128 + 80 * __import__('math').sin(elapsed * 3 + 1))  # 3Hz offset
+            # Music packet (64 bytes)
+            payload = [0x01, 0xC0, 0x00, bass, freq_l, freq_r] + [0x00] * 58
             
-            # Clamp values to 0-255
-            bass = max(0, min(255, bass))
-            freq_l = max(0, min(255, freq_l))
-            freq_r = max(0, min(255, freq_r))
+            # Send to all devices
+            for device_info in devices:
+                try:
+                    device = device_info['device']
+                    device.open()
+                    device.write(payload)
+                    device.close()
+                except Exception:
+                    pass
             
-            # Build 64-byte interrupt packet
-            packet = bytearray(64)
-            packet[0] = 0x01  # Report ID
-            packet[1] = 0xC0  # Fixed
-            packet[2] = 0x00  # Fixed
-            packet[3] = bass  # Bass/Energy
-            packet[4] = freq_l  # Left channel
-            packet[5] = freq_r  # Right channel
-            # Rest is zeros (padding)
+            tick += 1
+            time.sleep(0.01)  # ~100Hz update rate
             
-            # Send interrupt report to endpoint 0x02
-            try:
-                dev.write(bytes(packet))
-                packet_count += 1
-            except Exception as e:
-                print(f"Warning: Failed to send packet: {e}")
-            
-            # Target ~100Hz (10ms between packets)
-            time.sleep(0.01)
-        
-        dev.close()
-        print(f"Music mode stopped. Sent {packet_count} packets.")
-    
-    except Exception as e:
-        print(f"Error in music streaming: {e}")
-    
+    except KeyboardInterrupt:
+        pass
     finally:
-        _music_streaming = False
-
-
-def list_modes():
-    """List all available modes."""
-    print("Available modes:")
-    for mode in MODES.keys():
-        print(f"  - {mode}")
-
-
-def list_colors():
-    """List all available color presets."""
-    print("Available color presets:")
-    for color_name, (r, g, b) in COLORS.items():
-        print(f"  - {color_name}: RGB({r}, {g}, {b})")
+        print("Music mode stopped")
 
 
 def main():
-    """
-    CLI interface for setting modes and colors.
+    """Main CLI entry point"""
+    import argparse
     
-    Default behavior (no arguments): Cycles through all modes (5s each).
-    With arguments: Set specific mode and optional colors for base and rear zones.
+    parser = argparse.ArgumentParser(
+        description='ViewSonic RGB Controller - Razer Chroma SDK Support',
+        prog='set_mode.py'
+    )
     
-    Usage:
-        python set_mode.py                                              # Cycle all modes
-        python set_mode.py <mode>                                       # Set mode with default colors
-        python set_mode.py <mode> <color>                               # Set mode with same color on both zones
-        python set_mode.py <mode> <color_base> <color_rear>             # Set mode with different colors per zone
-        python set_mode.py <mode> <R> <G> <B>                           # Set mode with custom RGB (both zones)
-        python set_mode.py <mode> <R1> <G1> <B1> <R2> <G2> <B2>        # Set mode with different RGB per zone
-        python set_mode.py music [duration]                             # Start music mode (optional duration in seconds)
-        python set_mode.py music-pulse [duration]                       # Start music-pulse mode (optional duration in seconds)
-    """
-    if len(sys.argv) >= 2:
-        # User provided mode argument
-        mode = sys.argv[1].lower()
-        
-        # Handle music modes separately
-        if mode in ["music", "music-pulse"]:
-            duration = None
-            if len(sys.argv) >= 3:
-                try:
-                    duration = int(sys.argv[2])
-                except ValueError:
-                    print("Error: Duration must be an integer (seconds)")
-                    return
-            
+    parser.add_argument(
+        'command',
+        nargs='?',
+        default='list',
+        help='Command: list, rainbow, breathing, stack, warp-speed, music, music-pulse, static'
+    )
+    
+    parser.add_argument(
+        '--device',
+        type=int,
+        default=None,
+        help='Device index (default: all devices)'
+    )
+    
+    parser.add_argument(
+        'colors',
+        nargs='*',
+        help='Color name(s) or RGB values'
+    )
+    
+    args = parser.parse_args()
+    
+    if args.command == 'list':
+        list_viewsonic_devices()
+        return
+    
+    # Parse colors
+    color_base = None
+    color_rear = None
+    
+    if args.colors:
+        first = args.colors[0]
+        if first in COLORS:
+            color_base = COLORS[first]
+        else:
             try:
-                set_music_mode(mode, duration)
-                
-                # If duration specified, wait for it
-                if duration:
-                    time.sleep(duration + 1)  # +1 second for safety
-                    stop_music_mode()
-                else:
-                    # Keep the program running
-                    try:
-                        while _music_streaming:
-                            time.sleep(0.1)
-                    except KeyboardInterrupt:
-                        print("\n")
-                        stop_music_mode()
-            
-            except KeyboardInterrupt:
-                print("\n")
-                stop_music_mode()
-            return
-        
-        # Handle regular modes
-        color_base = None
-        color_rear = None
-        
-        # Parse color arguments
-        if len(sys.argv) >= 3:
-            try:
-                # Check for RGB format with two zones (7 arguments: mode + R1 G1 B1 R2 G2 B2)
-                if len(sys.argv) == 8:
-                    r1 = int(sys.argv[2])
-                    g1 = int(sys.argv[3])
-                    b1 = int(sys.argv[4])
-                    r2 = int(sys.argv[5])
-                    g2 = int(sys.argv[6])
-                    b2 = int(sys.argv[7])
-                    color_base = (r1, g1, b1)
-                    color_rear = (r2, g2, b2)
-                # Check for RGB format single color (5 arguments: mode + R G B)
-                elif len(sys.argv) == 5:
-                    r = int(sys.argv[2])
-                    g = int(sys.argv[3])
-                    b = int(sys.argv[4])
-                    color_base = (r, g, b)
-                # Check for two color names (4 arguments: mode + color1 + color2)
-                elif len(sys.argv) == 4:
-                    color_base = sys.argv[2]
-                    color_rear = sys.argv[3]
-                # Single argument after mode
-                else:
-                    color_base = sys.argv[2]
+                if len(args.colors) >= 3:
+                    color_base = (int(args.colors[0]), int(args.colors[1]), int(args.colors[2]))
+                    if len(args.colors) >= 6:
+                        color_rear = (int(args.colors[3]), int(args.colors[4]), int(args.colors[5]))
             except ValueError:
-                # If conversion fails, treat as color names
-                if len(sys.argv) == 4:
-                    color_base = sys.argv[2]
-                    color_rear = sys.argv[3]
-                else:
-                    color_base = sys.argv[2]
-        
-        set_mode(mode, color_base, color_rear)
+                print(f"ERROR: Invalid color format '{first}'")
+                return
+    
+    # Execute command
+    if args.command in MODES:
+        set_mode(args.command, color_base, color_rear, args.device)
+    elif args.command == 'music' or args.command == 'music-pulse':
+        duration = None
+        if args.colors and args.colors[0].isdigit():
+            duration = int(args.colors[0])
+        set_music_mode(args.command, duration, args.device)
     else:
-        # Default behavior: cycle through all modes
-        print("Cycling through all modes (5s each)...")
-        print("Press Ctrl+C to stop\n")
-        
-        try:
-            # Cycle through modes
-            print("=== MODES ===")
-            for mode_name in MODES.keys():
-                # Skip music modes in default cycle
-                if mode_name not in ["music", "music-pulse"]:
-                    print(f"Setting mode: {mode_name}")
-                    set_mode(mode_name)
-                    time.sleep(5)
-            
-            # Cycle through colors in static mode
-            print("\n=== COLORS (Static Mode) ===")
-            for color_name, (r, g, b) in COLORS.items():
-                print(f"Setting color: {color_name} RGB({r}, {g}, {b})")
-                set_mode("static", color_name)
-                time.sleep(3)
-
-            # print("\n=== MUSIC MODE ===")
-            # set_music_mode("music")
-            # time.sleep(20)
-            # stop_music_mode()
-
-            print("\nCycle complete!")
-        
-        except KeyboardInterrupt:
-            print("\n\nCycle interrupted by user")
-            sys.exit(0)
+        print(f"ERROR: Unknown command '{args.command}'")
+        print(f"Available commands: list, {', '.join(MODES.keys())}")
 
 
 if __name__ == "__main__":
